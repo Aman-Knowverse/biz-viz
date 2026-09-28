@@ -420,10 +420,42 @@ def _count_column(table: ModelTable) -> str:
     return min(candidates, key=lambda c: (c.n_null, candidates.index(c))).name
 
 
+def _reserved_names(tables: list[ModelTable]) -> set[str]:
+    """Every name a measure is not allowed to take.
+
+    Power BI refuses to create a measure whose name matches an existing column,
+    and rejects the *entire* model definition when it happens rather than
+    skipping the one measure. Real data hits this more often than it sounds:
+    a column called "Total Indian Stocks" is perfectly normal, and the naming
+    rule that avoids "Total Total Indian Stocks" then lands exactly on it.
+    """
+    return {c.name.strip().lower() for t in tables for c in t.columns}
+
+
+def _unique_measure_name(base: str, agg: str, column: str, table: str,
+                         reserved: set[str]) -> str:
+    """Find a measure name that collides with nothing.
+
+    Falls back to the form Power BI itself would use for a dragged field
+    ("Sum of X"), then qualifies by table, then by number. Returning a
+    colliding name is not an option — it breaks the whole model, not one field.
+    """
+    verb = {"SUM": "Sum", "AVERAGE": "Average", "COUNTROWS": "Count"}.get(agg, "Sum")
+    for candidate in (base, f"{verb} of {column}", f"{base} ({table})",
+                      f"{verb} of {column} ({table})"):
+        if candidate.strip().lower() not in reserved:
+            return candidate
+    i = 2
+    while f"{base} {i}".strip().lower() in reserved:
+        i += 1
+    return f"{base} {i}"
+
+
 def default_measures(tables: list[ModelTable], max_per_table: int = 12) -> list[Measure]:
     """One aggregation per numeric column, plus a row count per table."""
     measures: list[Measure] = []
-    used_names: set[str] = set()
+    # Seeded with every column name, so a measure can never shadow one.
+    used_names: set[str] = _reserved_names(tables)
 
     for t in tables:
         if t.is_date_table:
@@ -432,13 +464,10 @@ def default_measures(tables: list[ModelTable], max_per_table: int = 12) -> list[
 
         for col in numeric:
             agg = "AVERAGE" if _PERCENT_HINT.search(col.name) else "SUM"
-            display = _measure_display_name(col.name)
-            base = display
-            i = 2
-            while display in used_names:
-                display = f"{base} ({t.name})" if i == 2 else f"{base} {i}"
-                i += 1
-            used_names.add(display)
+            display = _unique_measure_name(
+                _measure_display_name(col.name), agg, prettify(col.name), t.name, used_names
+            )
+            used_names.add(display.strip().lower())
             measures.append(
                 Measure(
                     name=display,
@@ -451,9 +480,11 @@ def default_measures(tables: list[ModelTable], max_per_table: int = 12) -> list[
                 )
             )
 
-        count_name = f"{prettify(t.name)} Count"
-        if count_name not in used_names:
-            used_names.add(count_name)
+        count_name = _unique_measure_name(
+            f"{prettify(t.name)} Count", "COUNTROWS", prettify(t.name), t.name, used_names
+        )
+        if count_name.strip().lower() not in used_names:
+            used_names.add(count_name.strip().lower())
             measures.append(
                 Measure(
                     name=count_name,
